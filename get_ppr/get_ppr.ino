@@ -2,18 +2,24 @@
  * ===============================================
  *  GET ENCODER PPR (Pulses Per Revolution)
  * ===============================================
- *  Setup: 1x N20 motor + L298N + ESP32 via USB
- *         Testing ONE motor at a time.
+ *  Board:  NodeMCU ESP8266 (USB powered)
+ *  Driver: TB6612FNG
+ *  Motor:  1x N20 encoder motor (6-wire)
  *
- *  Wiring (adjust pins below if different):
- *    L298N ENA  → ESP32 GPIO 25
- *    L298N IN1  → ESP32 GPIO 26
- *    L298N IN2  → ESP32 GPIO 27
- *    Encoder A  → ESP32 GPIO 32
- *    Encoder B  → ESP32 GPIO 33
- *    Encoder VCC → ESP32 3.3V
- *    Encoder GND → ESP32 GND
- *    Motor +/-  → L298N OUT1/OUT2
+ *  Wiring:
+ *    TB6612FNG PWMA → D5 (GPIO14)
+ *    TB6612FNG AIN1 → D6 (GPIO12)
+ *    TB6612FNG AIN2 → D7 (GPIO13)
+ *    TB6612FNG VM   → NodeMCU VIN (5V from USB)
+ *    TB6612FNG VCC  → NodeMCU 3.3V
+ *    TB6612FNG GND  → GND
+ *    TB6612FNG STBY → 3.3V (tied HIGH, enables driver)
+ *    TB6612FNG A01  → Motor wire 1 (Motor +)
+ *    TB6612FNG A02  → Motor wire 6 (Motor -)
+ *    Encoder VCC (wire 2) → 3.3V
+ *    Encoder GND (wire 5) → GND
+ *    Encoder A   (wire 3) → D1 (GPIO5)
+ *    Encoder B   (wire 4) → D2 (GPIO4)
  *
  *  How to use:
  *    1. Upload this sketch, open Serial Monitor (115200)
@@ -21,38 +27,32 @@
  *    3. Send 'r' to reset counter
  *    4. Rotate the wheel exactly 1 full revolution BY HAND
  *    5. Read the tick count → that's your PPR
- *    6. Or send 'm' to run motor for 3 sec, count revolutions
+ *    6. Or send 'f' to run motor 3 sec, count revolutions
  *       visually, then PPR = ticks / revolutions
- *    7. Repeat for the second motor (swap wires on L298N
- *       and encoder pins on ESP32, or just connect the
- *       other motor to the same terminals)
  * ===============================================
  */
 
 #include <Arduino.h>
 
 // =============================================
-//  PIN DEFINITIONS — match to YOUR wiring
+//  PIN DEFINITIONS
 // =============================================
-// L298N control pins (one channel only — Motor A side)
-const int ENA = 25;   // PWM enable
-const int IN1 = 26;   // Direction
-const int IN2 = 27;   // Direction
+// TB6612FNG Motor A channel
+const int PWMA = 14;  // D5
+const int AIN1 = 12;  // D6
+const int AIN2 = 13;  // D7
 
-// Encoder pins (match your working wiring)
-const int ENC_A = 21;  // Encoder channel A (interrupt)
-const int ENC_B = 18;  // Encoder channel B
+// Encoder (D1/D2 support interrupts on ESP8266)
+const int ENC_A = 5;   // D1
+const int ENC_B = 4;   // D2
 // =============================================
-
-// LEDC PWM config
-const int PWM_FREQ = 5000;
-const int PWM_RES  = 8;
 
 // Encoder counter
 volatile long ticks = 0;
 
 // Simple counting ISR — just count pulses for PPR measurement
-void IRAM_ATTR encoderISR() {
+// ESP8266 uses ICACHE_RAM_ATTR instead of IRAM_ATTR
+void ICACHE_RAM_ATTR encoderISR() {
     ticks++;
 }
 
@@ -60,13 +60,13 @@ void setup() {
     Serial.begin(115200);
     delay(500);
 
-    // Motor pins
-    pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
-    digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
-
-    // LEDC PWM (ESP32 Core 3.x API)
-    ledcAttach(ENA, PWM_FREQ, PWM_RES);
-    ledcWrite(ENA, 0);
+    // Motor driver pins (TB6612FNG)
+    pinMode(AIN1, OUTPUT); pinMode(AIN2, OUTPUT);
+    pinMode(PWMA, OUTPUT);
+    digitalWrite(AIN1, LOW); digitalWrite(AIN2, LOW);
+    // ESP8266 analogWrite range is 0-1023 by default; set to 0-255
+    analogWriteRange(255);
+    analogWrite(PWMA, 0);
 
     // Encoder pins
     pinMode(ENC_A, INPUT_PULLUP);
@@ -74,11 +74,10 @@ void setup() {
     attachInterrupt(digitalPinToInterrupt(ENC_A), encoderISR, RISING);
 
     Serial.println("========================================");
-    Serial.println("  ENCODER PPR — Single Motor Test");
+    Serial.println("  ENCODER PPR — NodeMCU + TB6612FNG");
     Serial.println("========================================");
-    Serial.println("  Wiring: L298N Motor A channel");
-    Serial.printf( "  ENA=%d  IN1=%d  IN2=%d\n", ENA, IN1, IN2);
-    Serial.printf( "  ENC_A=%d  ENC_B=%d\n", ENC_A, ENC_B);
+    Serial.println("  Motor A: PWMA=D5 AIN1=D6 AIN2=D7");
+    Serial.println("  Encoder: A=D1  B=D2");
     Serial.println("========================================");
     Serial.println("Commands:");
     Serial.println("  r = Reset counter to 0");
@@ -93,19 +92,20 @@ void setup() {
 }
 
 void stopMotor() {
-    digitalWrite(IN1, LOW);
-    digitalWrite(IN2, LOW);
-    ledcWrite(ENA, 0);
+    // Coast stop (AIN1=L, AIN2=L on TB6612FNG)
+    digitalWrite(AIN1, LOW);
+    digitalWrite(AIN2, LOW);
+    analogWrite(PWMA, 0);
 }
 
 void runMotor(bool forward, int pwm, int durationMs) {
     ticks = 0;
     if (forward) {
-        digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+        digitalWrite(AIN1, HIGH); digitalWrite(AIN2, LOW);
     } else {
-        digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+        digitalWrite(AIN1, LOW);  digitalWrite(AIN2, HIGH);
     }
-    ledcWrite(ENA, pwm);
+    analogWrite(PWMA, pwm);
     delay(durationMs);
     stopMotor();
 }
@@ -115,7 +115,7 @@ unsigned long lastPrint = 0;
 void loop() {
     // Live tick display every 500ms
     if (millis() - lastPrint > 500) {
-        Serial.printf("  Ticks: %ld\n", ticks);
+        Serial.print("  Ticks: "); Serial.println(ticks);
         lastPrint = millis();
     }
 
@@ -128,24 +128,24 @@ void loop() {
                 break;
 
             case 'p':
-                Serial.printf("\n>> Ticks = %ld\n\n", ticks);
+                Serial.print("\n>> Ticks = "); Serial.print(ticks); Serial.println("\n");
                 break;
 
             case 'm':
             case 'f':
                 Serial.println("\n>> Running motor FORWARD for 3 seconds...");
                 Serial.println("   Count full revolutions visually!");
-                runMotor(true, 80, 3000);
-                Serial.printf(">> Done. Ticks = %ld\n", ticks);
+                runMotor(true, 100, 3000);
+                Serial.print(">> Done. Ticks = "); Serial.println(ticks);
                 Serial.println("   PPR = ticks / revolutions_you_counted\n");
                 break;
 
             case 'b':
                 Serial.println("\n>> Running motor BACKWARD for 3 seconds...");
                 Serial.println("   Count full revolutions visually!");
-                runMotor(false, 80, 3000);
-                Serial.printf(">> Done. Ticks = %ld (should be negative)\n", ticks);
-                Serial.println("   PPR = abs(ticks) / revolutions_you_counted\n");
+                runMotor(false, 100, 3000);
+                Serial.print(">> Done. Ticks = "); Serial.println(ticks);
+                Serial.println("   PPR = ticks / revolutions_you_counted\n");
                 break;
         }
     }
