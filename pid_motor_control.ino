@@ -136,10 +136,9 @@ void turnRight90() {
 }
 
 void loop() {
-    // Example test sequence:
-    // delay(2000);
-    // moveForwardOneCell();
-    // delay(500);
-    // turnRight90();
-    // delay(10000); // Wait before repeating
+    delay(2000);
+    moveForwardOneCell();
+    delay(500);
+    turnRight90();
+    delay(2000);
 }
