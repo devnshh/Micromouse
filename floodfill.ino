@@ -1,106 +1,639 @@
+/*
+ * ================================================================
+ *  MICROMOUSE — Integrated Floodfill + Motor Control + Navigation
+ * ================================================================
+ *  Hardware:
+ *    - ESP32-WROOM-DA
+ *    - TB6612FNG motor driver
+ *    - 2x N20 motors with quadrature encoders
+ *    - 3x HC-SR04 ultrasonic sensors (front, left, right)
+ *    - 2x 3.7V LiPo batteries (series = 7.4V) + buck converter
+ *
+ *  See CHANGES.md for calibration checklist and what to adjust.
+ * ================================================================
+ */
+
 #include <Arduino.h>
 
+// ================================================================
+//  PIN DEFINITIONS — Adjust these to match YOUR wiring
+// ================================================================
+
+// --- TB6612FNG Motor Driver ---
+// Motor A (Left)
+const int PWMA = 25;   // PWM speed control
+const int AIN1 = 26;   // Direction
+const int AIN2 = 27;   // Direction
+// Motor B (Right)
+const int PWMB = 14;   // PWM speed control
+const int BIN1 = 12;   // Direction
+const int BIN2 = 13;   // Direction
+// Standby — MUST be HIGH for motors to run
+const int STBY = 4;    // *** ADJUST to your wiring ***
+
+// --- Encoder Pins (Quadrature A+B channels) ---
+// Avoid GPIO 34-39 for pins needing internal pull-ups
+const int ENC_L_A = 32;
+const int ENC_L_B = 33;
+const int ENC_R_A = 16;
+const int ENC_R_B = 17;
+
+// --- Ultrasonic Sensor Pins ---
+const int TRIG_FRONT = 5;
+const int ECHO_FRONT = 18;
+const int TRIG_LEFT  = 19;
+const int ECHO_LEFT  = 21;
+const int TRIG_RIGHT = 22;
+const int ECHO_RIGHT = 23;
+
+// --- Battery Voltage Monitoring (via voltage divider) ---
+const int VBAT_PIN = 35;  // Input-only pin, fine for ADC
+const float VBAT_DIVIDER_RATIO = 2.0; // *** ADJUST to your divider ***
+const float LOW_BATTERY_VOLTAGE = 6.0; // 2S LiPo cutoff (~3.0V/cell)
+
+// --- LEDC PWM Configuration ---
+const int PWM_FREQ       = 20000; // 20 kHz — silent operation
+const int PWM_RESOLUTION = 8;     // 8-bit (0-255)
+const int PWM_CH_LEFT    = 0;
+const int PWM_CH_RIGHT   = 1;
+
+// ================================================================
+//  CALIBRATION VALUES — *** MUST MEASURE & ADJUST AFTER TESTING ***
+// ================================================================
+
+// Encoder ticks for one maze cell (18 cm) — drive straight, read count
+long TICKS_PER_CELL    = 360;
+// Encoder ticks for an in-place 90° turn — spin in place, read count
+long TICKS_PER_90_DEG  = 190;
+
+// Ultrasonic distance thresholds (cm)
+const float WALL_THRESHOLD_CM  = 8.0;  // Below this → wall present
+const float SIDE_CENTER_DIST   = 5.5;  // Ideal side-wall distance when centered
+
+// Minimum PWM where your N20 motors actually start moving
+const int MOTOR_MIN_PWM = 45;
+
+// PID gains for wheel-distance control (tune Kp first, then Kd, then Ki)
+float Kp = 2.0;
+float Ki = 0.02;
+float Kd = 0.8;
+
+// PID gains for side-wall steering correction during straight moves
+float steerKp = 3.0;
+float steerKd = 1.0;
+
+// Speeds
+const int BASE_SPEED      = 120; // Exploration (0-255)
+const int SPEED_RUN_SPEED = 200; // Fast run   (0-255)
+
+// Timeout for any single PID move (ms) — safety stop
+const unsigned long MOVE_TIMEOUT_MS = 3000;
+
+// ================================================================
+//  MAZE CONSTANTS & DATA
+// ================================================================
 #define MAZE_SIZE 16
 
-// Bitmasks for walls
 #define WALL_NORTH 1
 #define WALL_EAST  2
 #define WALL_SOUTH 4
 #define WALL_WEST  8
 
-// Maze arrays
 uint8_t walls[MAZE_SIZE][MAZE_SIZE];
-int distances[MAZE_SIZE][MAZE_SIZE];
+int     distances[MAZE_SIZE][MAZE_SIZE];
+bool    visited[MAZE_SIZE][MAZE_SIZE];
 
-// Simple struct for queue coordinates
-struct Cell {
-    int x, y;
-};
+// Direction look-up tables: N=0, E=1, S=2, W=3
+const int     DX[]        = { 0,  1,  0, -1};
+const int     DY[]        = { 1,  0, -1,  0};
+const uint8_t WALL_BITS[] = {WALL_NORTH, WALL_EAST, WALL_SOUTH, WALL_WEST};
 
-// Static circular queue for fast floodfill updates
-Cell queue[MAZE_SIZE * MAZE_SIZE];
-int head = 0;
-int tail = 0;
+// ================================================================
+//  ROBOT STATE
+// ================================================================
+int posX    = 0;  // Current cell X
+int posY    = 0;  // Current cell Y
+int heading = 0;  // 0=N  1=E  2=S  3=W
 
-void push(int x, int y) {
-    queue[tail].x = x;
-    queue[tail].y = y;
-    tail = (tail + 1) % (MAZE_SIZE * MAZE_SIZE);
+// Speed-run pre-computed path
+int speedRunPath[256];
+int speedRunLength = 0;
+
+// ================================================================
+//  ENCODER VARIABLES
+// ================================================================
+volatile long countLeft  = 0;
+volatile long countRight = 0;
+
+// ================================================================
+//  FLOODFILL QUEUE (static circular buffer)
+// ================================================================
+struct Cell { int x, y; };
+Cell qBuf[MAZE_SIZE * MAZE_SIZE];
+int  qHead = 0, qTail = 0;
+
+void qPush(int x, int y) {
+    qBuf[qTail] = {x, y};
+    qTail = (qTail + 1) % (MAZE_SIZE * MAZE_SIZE);
 }
-
-Cell pop() {
-    Cell c = queue[head];
-    head = (head + 1) % (MAZE_SIZE * MAZE_SIZE);
+Cell qPop() {
+    Cell c = qBuf[qHead];
+    qHead = (qHead + 1) % (MAZE_SIZE * MAZE_SIZE);
     return c;
 }
+bool qEmpty() { return qHead == qTail; }
 
-bool isQueueEmpty() {
-    return head == tail;
+// ================================================================
+//  INTERRUPT SERVICE ROUTINES — Quadrature Encoders
+// ================================================================
+void IRAM_ATTR isrLeft()  { countLeft  += digitalRead(ENC_L_B) ? -1 : 1; }
+void IRAM_ATTR isrRight() { countRight += digitalRead(ENC_R_B) ? -1 : 1; }
+
+// ================================================================
+//  MOTOR CONTROL (TB6612FNG + LEDC PWM)
+// ================================================================
+void setMotorLeft(int speed) {
+    if (speed > 0) {
+        digitalWrite(AIN1, HIGH); digitalWrite(AIN2, LOW);
+    } else if (speed < 0) {
+        digitalWrite(AIN1, LOW);  digitalWrite(AIN2, HIGH);
+        speed = -speed;
+    } else {
+        digitalWrite(AIN1, LOW);  digitalWrite(AIN2, LOW);
+    }
+    if (speed > 0 && speed < MOTOR_MIN_PWM) speed = MOTOR_MIN_PWM;
+    speed = constrain(speed, 0, 255);
+    ledcWrite(PWM_CH_LEFT, speed);
 }
 
-// 1. Initialize the maze with Manhattan distances to the center
+void setMotorRight(int speed) {
+    if (speed > 0) {
+        digitalWrite(BIN1, HIGH); digitalWrite(BIN2, LOW);
+    } else if (speed < 0) {
+        digitalWrite(BIN1, LOW);  digitalWrite(BIN2, HIGH);
+        speed = -speed;
+    } else {
+        digitalWrite(BIN1, LOW);  digitalWrite(BIN2, LOW);
+    }
+    if (speed > 0 && speed < MOTOR_MIN_PWM) speed = MOTOR_MIN_PWM;
+    speed = constrain(speed, 0, 255);
+    ledcWrite(PWM_CH_RIGHT, speed);
+}
+
+void stopMotors() {
+    setMotorLeft(0);
+    setMotorRight(0);
+}
+
+// ================================================================
+//  ULTRASONIC SENSORS
+// ================================================================
+float readUltrasonic(int trigPin, int echoPin) {
+    digitalWrite(trigPin, LOW);
+    delayMicroseconds(2);
+    digitalWrite(trigPin, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(trigPin, LOW);
+    long duration = pulseIn(echoPin, HIGH, 15000); // 15 ms timeout
+    if (duration == 0) return 999.0;               // No echo → no wall
+    return duration * 0.0343 / 2.0;                // → centimeters
+}
+
+// Median of 3 readings — eliminates noise spikes
+float readUltrasonicFiltered(int trigPin, int echoPin) {
+    float r[3];
+    for (int i = 0; i < 3; i++) {
+        r[i] = readUltrasonic(trigPin, echoPin);
+        delayMicroseconds(200);
+    }
+    // Simple bubble sort for 3 elements → return median
+    if (r[0] > r[1]) { float t = r[0]; r[0] = r[1]; r[1] = t; }
+    if (r[1] > r[2]) { float t = r[1]; r[1] = r[2]; r[2] = t; }
+    if (r[0] > r[1]) { float t = r[0]; r[0] = r[1]; r[1] = t; }
+    return r[1];
+}
+
+float readFront() { return readUltrasonicFiltered(TRIG_FRONT, ECHO_FRONT); }
+float readLeft()  { return readUltrasonicFiltered(TRIG_LEFT,  ECHO_LEFT);  }
+float readRight() { return readUltrasonicFiltered(TRIG_RIGHT, ECHO_RIGHT); }
+
+// ================================================================
+//  BATTERY MONITORING
+// ================================================================
+float readBatteryVoltage() {
+    int raw = analogRead(VBAT_PIN);
+    return (raw / 4095.0) * 3.3 * VBAT_DIVIDER_RATIO;
+}
+
+bool isBatteryLow() {
+    return readBatteryVoltage() < LOW_BATTERY_VOLTAGE;
+}
+
+// ================================================================
+//  MAZE INITIALIZATION
+// ================================================================
 void initMaze() {
     for (int x = 0; x < MAZE_SIZE; x++) {
         for (int y = 0; y < MAZE_SIZE; y++) {
-            walls[x][y] = 0; // No walls known initially (except borders, handled later)
-            
-            // Standard target is the center 4 cells for a 16x16 maze
-            // x: 7, 8 | y: 7, 8
+            walls[x][y]    = 0;
+            visited[x][y]  = false;
+            // Manhattan distance to nearest center cell (7,7)-(8,8)
             int dx = max(0, max(7 - x, x - 8));
             int dy = max(0, max(7 - y, y - 8));
             distances[x][y] = dx + dy;
         }
     }
+    // Outer border walls are always present
+    for (int i = 0; i < MAZE_SIZE; i++) {
+        walls[i][0]             |= WALL_SOUTH;
+        walls[i][MAZE_SIZE - 1] |= WALL_NORTH;
+        walls[0][i]             |= WALL_WEST;
+        walls[MAZE_SIZE - 1][i] |= WALL_EAST;
+    }
+    // Starting cell (0,0) has known south + west walls
+    walls[0][0] |= (WALL_SOUTH | WALL_WEST);
 }
 
-// 2. Check the minimum distance of reachable neighbors
-int getMinNeighborDistance(int x, int y) {
-    int min_dist = 999;
-    if (!(walls[x][y] & WALL_NORTH) && y < MAZE_SIZE - 1) min_dist = min(min_dist, distances[x][y + 1]);
-    if (!(walls[x][y] & WALL_EAST)  && x < MAZE_SIZE - 1) min_dist = min(min_dist, distances[x + 1][y]);
-    if (!(walls[x][y] & WALL_SOUTH) && y > 0)             min_dist = min(min_dist, distances[x][y - 1]);
-    if (!(walls[x][y] & WALL_WEST)  && x > 0)             min_dist = min(min_dist, distances[x - 1][y]);
-    return min_dist;
+// ================================================================
+//  FLOODFILL ALGORITHM
+// ================================================================
+int getMinNeighborDist(int x, int y) {
+    int md = 999;
+    if (!(walls[x][y] & WALL_NORTH) && y < MAZE_SIZE - 1) md = min(md, distances[x][y + 1]);
+    if (!(walls[x][y] & WALL_EAST)  && x < MAZE_SIZE - 1) md = min(md, distances[x + 1][y]);
+    if (!(walls[x][y] & WALL_SOUTH) && y > 0)             md = min(md, distances[x][y - 1]);
+    if (!(walls[x][y] & WALL_WEST)  && x > 0)             md = min(md, distances[x - 1][y]);
+    return md;
 }
 
-// 3. The Core Floodfill Update logic
+// Propagate distance updates after a wall change
 void updateDistances() {
-    while (!isQueueEmpty()) {
-        Cell current = pop();
-        int cx = current.x;
-        int cy = current.y;
-
-        // The center cells should always be 0
-        if ((cx == 7 || cx == 8) && (cy == 7 || cy == 8)) continue;
-
-        int min_neighbor = getMinNeighborDistance(cx, cy);
-
-        // If the current distance is incorrect based on walls, update it and push neighbors
-        if (distances[cx][cy] != min_neighbor + 1) {
-            distances[cx][cy] = min_neighbor + 1;
-
-            // Push all accessible neighbors to the queue to be re-evaluated
-            if (!(walls[cx][cy] & WALL_NORTH) && cy < MAZE_SIZE - 1) push(cx, cy + 1);
-            if (!(walls[cx][cy] & WALL_EAST)  && cx < MAZE_SIZE - 1) push(cx + 1, cy);
-            if (!(walls[cx][cy] & WALL_SOUTH) && cy > 0)             push(cx, cy - 1);
-            if (!(walls[cx][cy] & WALL_WEST)  && cx > 0)             push(cx - 1, cy);
+    while (!qEmpty()) {
+        Cell c = qPop();
+        if ((c.x == 7 || c.x == 8) && (c.y == 7 || c.y == 8)) continue;
+        int mn = getMinNeighborDist(c.x, c.y);
+        if (distances[c.x][c.y] != mn + 1) {
+            distances[c.x][c.y] = mn + 1;
+            if (!(walls[c.x][c.y] & WALL_NORTH) && c.y < MAZE_SIZE - 1) qPush(c.x, c.y + 1);
+            if (!(walls[c.x][c.y] & WALL_EAST)  && c.x < MAZE_SIZE - 1) qPush(c.x + 1, c.y);
+            if (!(walls[c.x][c.y] & WALL_SOUTH) && c.y > 0)             qPush(c.x, c.y - 1);
+            if (!(walls[c.x][c.y] & WALL_WEST)  && c.x > 0)             qPush(c.x - 1, c.y);
         }
     }
 }
 
-// 4. Function to call when your sensors detect a new wall
+// Record a newly-detected wall and trigger floodfill cascade
 void addWall(int x, int y, uint8_t wallType) {
-    if (!(walls[x][y] & wallType)) { // If wall isn't already recorded
-        walls[x][y] |= wallType;     // Add wall to current cell
-        
-        // Add corresponding wall to the neighboring cell
-        if (wallType == WALL_NORTH && y < MAZE_SIZE - 1) walls[x][y + 1] |= WALL_SOUTH;
-        if (wallType == WALL_EAST  && x < MAZE_SIZE - 1) walls[x + 1][y] |= WALL_WEST;
-        if (wallType == WALL_SOUTH && y > 0)             walls[x][y - 1] |= WALL_NORTH;
-        if (wallType == WALL_WEST  && x > 0)             walls[x - 1][y] |= WALL_EAST;
+    if (walls[x][y] & wallType) return; // already known
+    walls[x][y] |= wallType;
+    if (wallType == WALL_NORTH && y < MAZE_SIZE - 1) walls[x][y + 1] |= WALL_SOUTH;
+    if (wallType == WALL_EAST  && x < MAZE_SIZE - 1) walls[x + 1][y] |= WALL_WEST;
+    if (wallType == WALL_SOUTH && y > 0)             walls[x][y - 1] |= WALL_NORTH;
+    if (wallType == WALL_WEST  && x > 0)             walls[x - 1][y] |= WALL_EAST;
+    qPush(x, y);
+    updateDistances();
+}
 
-        // Push current and affected neighbor to queue to trigger floodfill cascade
-        push(x, y);
-        updateDistances();
+// Full BFS re-flood from a rectangular target region
+void floodFrom(int x1, int y1, int x2, int y2) {
+    for (int x = 0; x < MAZE_SIZE; x++)
+        for (int y = 0; y < MAZE_SIZE; y++)
+            distances[x][y] = 999;
+    for (int x = x1; x <= x2; x++)
+        for (int y = y1; y <= y2; y++) {
+            distances[x][y] = 0;
+            qPush(x, y);
+        }
+    while (!qEmpty()) {
+        Cell c = qPop();
+        int nd = distances[c.x][c.y] + 1;
+        if (!(walls[c.x][c.y] & WALL_NORTH) && c.y < MAZE_SIZE - 1 && distances[c.x][c.y + 1] > nd) {
+            distances[c.x][c.y + 1] = nd; qPush(c.x, c.y + 1);
+        }
+        if (!(walls[c.x][c.y] & WALL_EAST) && c.x < MAZE_SIZE - 1 && distances[c.x + 1][c.y] > nd) {
+            distances[c.x + 1][c.y] = nd; qPush(c.x + 1, c.y);
+        }
+        if (!(walls[c.x][c.y] & WALL_SOUTH) && c.y > 0 && distances[c.x][c.y - 1] > nd) {
+            distances[c.x][c.y - 1] = nd; qPush(c.x, c.y - 1);
+        }
+        if (!(walls[c.x][c.y] & WALL_WEST) && c.x > 0 && distances[c.x - 1][c.y] > nd) {
+            distances[c.x - 1][c.y] = nd; qPush(c.x - 1, c.y);
+        }
     }
+}
+
+void floodToCenter() { floodFrom(7, 7, 8, 8); }
+void floodToStart()  { floodFrom(0, 0, 0, 0); }
+
+// ================================================================
+//  SENSOR → WALL MAPPING
+// ================================================================
+void scanAndUpdateWalls(int x, int y, int dir) {
+    float front = readFront();
+    float left  = readLeft();
+    float right = readRight();
+
+    Serial.printf("  Sensors  F:%.1f  L:%.1f  R:%.1f cm\n", front, left, right);
+
+    if (front < WALL_THRESHOLD_CM) addWall(x, y, WALL_BITS[dir]);
+    if (left  < WALL_THRESHOLD_CM) addWall(x, y, WALL_BITS[(dir + 3) % 4]);
+    if (right < WALL_THRESHOLD_CM) addWall(x, y, WALL_BITS[(dir + 1) % 4]);
+}
+
+// ================================================================
+//  PID MOVEMENT
+// ================================================================
+
+// Generic PID move — different tick targets per wheel (used for turns)
+void moveWithPID(long targetL, long targetR) {
+    countLeft = 0;
+    countRight = 0;
+
+    long errL = 0, errR = 0;
+    long lastErrL = 0, lastErrR = 0;
+    long intL = 0, intR = 0;
+
+    unsigned long t0 = millis();
+
+    while (abs(targetL - countLeft) > 3 || abs(targetR - countRight) > 3) {
+        if (millis() - t0 > MOVE_TIMEOUT_MS) {
+            Serial.println("! PID TIMEOUT");
+            stopMotors();
+            return;
+        }
+
+        errL = targetL - countLeft;
+        errR = targetR - countRight;
+
+        intL = constrain(intL + errL, -1000L, 1000L);
+        intR = constrain(intR + errR, -1000L, 1000L);
+
+        long dL = errL - lastErrL;
+        long dR = errR - lastErrR;
+
+        int spdL = (int)(Kp * errL + Ki * intL + Kd * dL);
+        int spdR = (int)(Kp * errR + Ki * intR + Kd * dR);
+
+        setMotorLeft(spdL);
+        setMotorRight(spdR);
+
+        lastErrL = errL;
+        lastErrR = errR;
+        delay(10);
+    }
+    stopMotors();
+}
+
+// Move forward one cell with side-wall steering correction
+void moveForwardWithSteering(int baseSpeed) {
+    countLeft  = 0;
+    countRight = 0;
+    float lastSteerErr = 0;
+    unsigned long t0 = millis();
+
+    while (abs(TICKS_PER_CELL - countLeft) > 3 || abs(TICKS_PER_CELL - countRight) > 3) {
+        if (millis() - t0 > MOVE_TIMEOUT_MS) {
+            Serial.println("! Steering TIMEOUT");
+            stopMotors();
+            return;
+        }
+
+        // --- Steering PID from side sensors ---
+        float ld = readLeft();
+        float rd = readRight();
+        float steerErr = 0;
+
+        bool hasL = (ld < WALL_THRESHOLD_CM * 1.5);
+        bool hasR = (rd < WALL_THRESHOLD_CM * 1.5);
+
+        if (hasL && hasR)      steerErr = ld - rd;                    // center between walls
+        else if (hasL)         steerErr = ld - SIDE_CENTER_DIST;      // hold left distance
+        else if (hasR)         steerErr = SIDE_CENTER_DIST - rd;      // hold right distance
+        // else: no side walls → rely on encoders only
+
+        float correction = steerKp * steerErr + steerKd * (steerErr - lastSteerErr);
+        lastSteerErr = steerErr;
+
+        // Slow down near target (trapezoidal-ish)
+        long remaining = (TICKS_PER_CELL - countLeft + TICKS_PER_CELL - countRight) / 2;
+        int speed = baseSpeed;
+        if (remaining < TICKS_PER_CELL / 4) speed = max(MOTOR_MIN_PWM, baseSpeed / 2);
+
+        int spdL = constrain(speed + (int)correction, 0, 255);
+        int spdR = constrain(speed - (int)correction, 0, 255);
+
+        setMotorLeft(spdL);
+        setMotorRight(spdR);
+        delay(10);
+    }
+    stopMotors();
+}
+
+void moveForwardOneCell() { moveForwardWithSteering(BASE_SPEED); }
+
+void turnLeft90()  { moveWithPID(-TICKS_PER_90_DEG, TICKS_PER_90_DEG); }
+void turnRight90() { moveWithPID( TICKS_PER_90_DEG, -TICKS_PER_90_DEG); }
+void turnAround()  { moveWithPID( TICKS_PER_90_DEG * 2, -TICKS_PER_90_DEG * 2); }
+
+// ================================================================
+//  HEADING & NAVIGATION HELPERS
+// ================================================================
+void turnToHeading(int target) {
+    int diff = (target - heading + 4) % 4;
+    if      (diff == 1) turnRight90();
+    else if (diff == 2) turnAround();
+    else if (diff == 3) turnLeft90();
+    heading = target;
+}
+
+int getBestDirection(int x, int y) {
+    int bestDir = -1, bestDist = 999;
+    for (int d = 0; d < 4; d++) {
+        if (walls[x][y] & WALL_BITS[d]) continue;
+        int nx = x + DX[d], ny = y + DY[d];
+        if (nx < 0 || nx >= MAZE_SIZE || ny < 0 || ny >= MAZE_SIZE) continue;
+        if (distances[nx][ny] < bestDist) {
+            bestDist = distances[nx][ny];
+            bestDir  = d;
+        }
+    }
+    return bestDir;
+}
+
+bool isAtCenter() { return (posX == 7 || posX == 8) && (posY == 7 || posY == 8); }
+bool isAtStart()  { return posX == 0 && posY == 0; }
+
+// ================================================================
+//  HIGH-LEVEL NAVIGATION
+// ================================================================
+void navigateToCenter() {
+    Serial.println("=== EXPLORING TO CENTER ===");
+    while (!isAtCenter()) {
+        if (isBatteryLow()) {
+            Serial.println("!!! LOW BATTERY — HALTING !!!");
+            stopMotors();
+            while (1) delay(1000);
+        }
+
+        visited[posX][posY] = true;
+        scanAndUpdateWalls(posX, posY, heading);
+
+        int bestDir = getBestDirection(posX, posY);
+        if (bestDir == -1) {
+            Serial.println("! No path — stuck!");
+            stopMotors();
+            return;
+        }
+
+        Serial.printf("(%d,%d) h=%d -> dir=%d  dist=%d\n",
+                       posX, posY, heading, bestDir, distances[posX][posY]);
+
+        turnToHeading(bestDir);
+        moveForwardOneCell();
+        posX += DX[bestDir];
+        posY += DY[bestDir];
+    }
+    Serial.println("=== REACHED CENTER ===");
+}
+
+void navigateToStart() {
+    Serial.println("=== RETURNING TO START ===");
+    floodToStart();
+    while (!isAtStart()) {
+        scanAndUpdateWalls(posX, posY, heading);
+        int bestDir = getBestDirection(posX, posY);
+        if (bestDir == -1) { stopMotors(); return; }
+        turnToHeading(bestDir);
+        moveForwardOneCell();
+        posX += DX[bestDir];
+        posY += DY[bestDir];
+    }
+    Serial.println("=== BACK AT START ===");
+}
+
+// ================================================================
+//  SPEED RUN
+// ================================================================
+void computeSpeedRunPath() {
+    floodToCenter();
+    speedRunLength = 0;
+    int sx = 0, sy = 0;
+    while (!((sx == 7 || sx == 8) && (sy == 7 || sy == 8))) {
+        int bestDir = -1, bestDist = 999;
+        for (int d = 0; d < 4; d++) {
+            if (walls[sx][sy] & WALL_BITS[d]) continue;
+            int nx = sx + DX[d], ny = sy + DY[d];
+            if (nx < 0 || nx >= MAZE_SIZE || ny < 0 || ny >= MAZE_SIZE) continue;
+            if (distances[nx][ny] < bestDist) {
+                bestDist = distances[nx][ny];
+                bestDir  = d;
+            }
+        }
+        if (bestDir == -1) break;
+        speedRunPath[speedRunLength++] = bestDir;
+        sx += DX[bestDir];
+        sy += DY[bestDir];
+    }
+    Serial.printf("Speed-run path: %d moves\n", speedRunLength);
+}
+
+void executeSpeedRun() {
+    Serial.println("=== SPEED RUN ===");
+    for (int i = 0; i < speedRunLength; i++) {
+        turnToHeading(speedRunPath[i]);
+        moveForwardWithSteering(SPEED_RUN_SPEED);
+        posX += DX[speedRunPath[i]];
+        posY += DY[speedRunPath[i]];
+    }
+    Serial.println("=== SPEED RUN COMPLETE ===");
+}
+
+// ================================================================
+//  DEBUG UTILITIES
+// ================================================================
+void printMazeDistances() {
+    Serial.println("\n--- Distances ---");
+    for (int y = MAZE_SIZE - 1; y >= 0; y--) {
+        for (int x = 0; x < MAZE_SIZE; x++)
+            Serial.printf("%3d", distances[x][y]);
+        Serial.println();
+    }
+}
+
+void printMazeWalls() {
+    Serial.println("\n--- Walls (hex) ---");
+    for (int y = MAZE_SIZE - 1; y >= 0; y--) {
+        for (int x = 0; x < MAZE_SIZE; x++)
+            Serial.printf(" %X", walls[x][y]);
+        Serial.println();
+    }
+}
+
+// ================================================================
+//  SETUP
+// ================================================================
+void setup() {
+    Serial.begin(115200);
+    delay(500);
+    Serial.println("Micromouse Initializing...");
+
+    // Motor driver pins
+    pinMode(AIN1, OUTPUT); pinMode(AIN2, OUTPUT);
+    pinMode(BIN1, OUTPUT); pinMode(BIN2, OUTPUT);
+    pinMode(STBY, OUTPUT);
+    digitalWrite(STBY, HIGH);  // Enable TB6612FNG
+
+    // LEDC PWM channels
+    ledcSetup(PWM_CH_LEFT,  PWM_FREQ, PWM_RESOLUTION);
+    ledcSetup(PWM_CH_RIGHT, PWM_FREQ, PWM_RESOLUTION);
+    ledcAttachPin(PWMA, PWM_CH_LEFT);
+    ledcAttachPin(PWMB, PWM_CH_RIGHT);
+
+    // Quadrature encoder pins
+    pinMode(ENC_L_A, INPUT_PULLUP);
+    pinMode(ENC_L_B, INPUT_PULLUP);
+    pinMode(ENC_R_A, INPUT_PULLUP);
+    pinMode(ENC_R_B, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(ENC_L_A), isrLeft,  RISING);
+    attachInterrupt(digitalPinToInterrupt(ENC_R_A), isrRight, RISING);
+
+    // Ultrasonic pins
+    pinMode(TRIG_FRONT, OUTPUT); pinMode(ECHO_FRONT, INPUT);
+    pinMode(TRIG_LEFT,  OUTPUT); pinMode(ECHO_LEFT,  INPUT);
+    pinMode(TRIG_RIGHT, OUTPUT); pinMode(ECHO_RIGHT, INPUT);
+
+    // Battery ADC
+    pinMode(VBAT_PIN, INPUT);
+    analogReadResolution(12);
+
+    // Maze
+    initMaze();
+
+    Serial.printf("Battery: %.2fV\n", readBatteryVoltage());
+    Serial.println("Ready — starting in 3 seconds...");
+    delay(3000);
+}
+
+// ================================================================
+//  MAIN LOOP
+// ================================================================
+void loop() {
+    // Phase 1: Explore maze to the center
+    navigateToCenter();
+    delay(1000);
+
+    // Phase 2: Return to start (continue mapping walls)
+    navigateToStart();
+    delay(1000);
+
+    // Phase 3: Compute shortest path & execute speed run
+    computeSpeedRunPath();
+    posX = 0; posY = 0; heading = 0;
+    executeSpeedRun();
+
+    // Done
+    Serial.println("=== ALL DONE ===");
+    printMazeDistances();
+    printMazeWalls();
+    while (1) delay(1000);
 }
