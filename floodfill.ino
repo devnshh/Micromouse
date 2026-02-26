@@ -54,8 +54,7 @@ const float LOW_BATTERY_VOLTAGE = 6.0; // 2S LiPo cutoff (~3.0V/cell)
 // --- LEDC PWM Configuration ---
 const int PWM_FREQ       = 20000; // 20 kHz — silent operation
 const int PWM_RESOLUTION = 8;     // 8-bit (0-255)
-const int PWM_CH_LEFT    = 0;
-const int PWM_CH_RIGHT   = 1;
+// (ESP32 Core 3.x: ledcAttach takes pin directly, no channel needed)
 
 // ================================================================
 //  CALIBRATION VALUES — *** MUST MEASURE & ADJUST AFTER TESTING ***
@@ -163,7 +162,7 @@ void setMotorLeft(int speed) {
     }
     if (speed > 0 && speed < MOTOR_MIN_PWM) speed = MOTOR_MIN_PWM;
     speed = constrain(speed, 0, 255);
-    ledcWrite(PWM_CH_LEFT, speed);
+    ledcWrite(PWMA, speed);
 }
 
 void setMotorRight(int speed) {
@@ -177,7 +176,7 @@ void setMotorRight(int speed) {
     }
     if (speed > 0 && speed < MOTOR_MIN_PWM) speed = MOTOR_MIN_PWM;
     speed = constrain(speed, 0, 255);
-    ledcWrite(PWM_CH_RIGHT, speed);
+    ledcWrite(PWMB, speed);
 }
 
 void stopMotors() {
@@ -583,11 +582,9 @@ void setup() {
     pinMode(STBY, OUTPUT);
     digitalWrite(STBY, HIGH);  // Enable TB6612FNG
 
-    // LEDC PWM channels
-    ledcSetup(PWM_CH_LEFT,  PWM_FREQ, PWM_RESOLUTION);
-    ledcSetup(PWM_CH_RIGHT, PWM_FREQ, PWM_RESOLUTION);
-    ledcAttachPin(PWMA, PWM_CH_LEFT);
-    ledcAttachPin(PWMB, PWM_CH_RIGHT);
+    // LEDC PWM (Core 3.x API — attach pin with freq + resolution)
+    ledcAttach(PWMA, PWM_FREQ, PWM_RESOLUTION);
+    ledcAttach(PWMB, PWM_FREQ, PWM_RESOLUTION);
 
     // Quadrature encoder pins
     pinMode(ENC_L_A, INPUT_PULLUP);

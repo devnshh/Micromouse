@@ -34,8 +34,7 @@ const int ENC_R_B = 17;
 // --- LEDC PWM Config ---
 const int PWM_FREQ       = 20000;
 const int PWM_RESOLUTION = 8;
-const int PWM_CH_LEFT    = 0;
-const int PWM_CH_RIGHT   = 1;
+// (ESP32 Core 3.x: ledcAttach takes pin directly, no channel needed)
 
 // --- Encoder Counters ---
 volatile long countLeft  = 0;
@@ -74,11 +73,9 @@ void setup() {
     pinMode(STBY, OUTPUT);
     digitalWrite(STBY, HIGH); // Enable TB6612FNG
 
-    // LEDC PWM
-    ledcSetup(PWM_CH_LEFT,  PWM_FREQ, PWM_RESOLUTION);
-    ledcSetup(PWM_CH_RIGHT, PWM_FREQ, PWM_RESOLUTION);
-    ledcAttachPin(PWMA, PWM_CH_LEFT);
-    ledcAttachPin(PWMB, PWM_CH_RIGHT);
+    // LEDC PWM (Core 3.x API)
+    ledcAttach(PWMA, PWM_FREQ, PWM_RESOLUTION);
+    ledcAttach(PWMB, PWM_FREQ, PWM_RESOLUTION);
 
     // Encoders
     pinMode(ENC_L_A, INPUT_PULLUP);
@@ -111,7 +108,7 @@ void setMotorLeft(int speed) {
     }
     if (speed > 0 && speed < MOTOR_MIN_PWM) speed = MOTOR_MIN_PWM;
     speed = constrain(speed, 0, 255);
-    ledcWrite(PWM_CH_LEFT, speed);
+    ledcWrite(PWMA, speed);
 }
 
 void setMotorRight(int speed) {
@@ -125,7 +122,7 @@ void setMotorRight(int speed) {
     }
     if (speed > 0 && speed < MOTOR_MIN_PWM) speed = MOTOR_MIN_PWM;
     speed = constrain(speed, 0, 255);
-    ledcWrite(PWM_CH_RIGHT, speed);
+    ledcWrite(PWMB, speed);
 }
 
 void stopMotors() {
@@ -187,9 +184,9 @@ void findMinPWM() {
     for (int pwm = 0; pwm <= 100; pwm += 5) {
         countLeft = 0;
         digitalWrite(AIN1, HIGH); digitalWrite(AIN2, LOW);
-        ledcWrite(PWM_CH_LEFT, pwm);
+        ledcWrite(PWMA, pwm);
         delay(300);
-        ledcWrite(PWM_CH_LEFT, 0);
+        ledcWrite(PWMA, 0);
         Serial.printf("  PWM=%3d  ticks=%ld\n", pwm, countLeft);
         delay(200);
     }
