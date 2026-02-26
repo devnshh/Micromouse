@@ -3,10 +3,10 @@
  *  MICROMOUSE — Integrated Floodfill + Motor Control + Navigation
  * ================================================================
  *  Hardware:
- *    - ESP32-WROOM-DA
- *    - TB6612FNG motor driver
- *    - 2x N20 motors with quadrature encoders
- *    - 3x HC-SR04 ultrasonic sensors (front, left, right)
+ *    - ESP8266 (NodeMCU/Wemos style boards)
+ *    - L298N motor driver (ENA/ENB jumpers installed)
+ *    - 2x N20 motors with encoders (A-channel used in this sketch)
+ *    - 3x HC-SR04 ultrasonic sensors (one-pin mode with ~2.2k tie)
  *    - 2x 3.7V LiPo batteries (series = 7.4V) + buck converter
  *
  *  See CHANGES.md for calibration checklist and what to adjust.
@@ -15,46 +15,42 @@
 
 #include <Arduino.h>
 
+#if !defined(ESP8266)
+#error "This sketch is configured for ESP8266. Select an ESP8266 board."
+#endif
+
 // ================================================================
 //  PIN DEFINITIONS — Adjust these to match YOUR wiring
 // ================================================================
 
-// --- TB6612FNG Motor Driver ---
-// Motor A (Left)
-const int PWMA = 25;   // PWM speed control
-const int AIN1 = 26;   // Direction
-const int AIN2 = 27;   // Direction
-// Motor B (Right)
-const int PWMB = 14;   // PWM speed control
-const int BIN1 = 12;   // Direction
-const int BIN2 = 13;   // Direction
-// Standby — MUST be HIGH for motors to run
-const int STBY = 4;    // *** ADJUST to your wiring ***
+// --- L298N Motor Driver ---
+// Keep ENA/ENB jumpers on L298N enabled; PWM is applied on IN pins.
+// D8 is a boot-strap pin on ESP8266; keep L298N input pull levels sane at boot.
+const int IN1 = D5;    // Left motor direction/PWM
+const int IN2 = D6;    // Left motor direction/PWM
+const int IN3 = D7;    // Right motor direction/PWM
+const int IN4 = D8;    // Right motor direction/PWM
 
-// --- Encoder Pins (Quadrature A+B channels) ---
-// Avoid GPIO 34-39 for pins needing internal pull-ups
-const int ENC_L_A = 32;
-const int ENC_L_B = 33;
-const int ENC_R_A = 16;
-const int ENC_R_B = 17;
+// --- Encoder Pins ---
+// ESP8266 pin budget is tight; this sketch uses channel A only.
+const int ENC_L_A = D1;
+const int ENC_R_A = D2;
 
-// --- Ultrasonic Sensor Pins ---
-const int TRIG_FRONT = 5;
-const int ECHO_FRONT = 18;
-const int TRIG_LEFT  = 19;
-const int ECHO_LEFT  = 21;
-const int TRIG_RIGHT = 22;
-const int ECHO_RIGHT = 23;
+// --- Ultrasonic Sensor Pins (one-pin mode per sensor) ---
+// Tie each sensor Trig and Echo with ~2.2k resistor and connect to one GPIO.
+// Keep ECHO voltage 3.3V-safe for ESP8266 (divider/level shifting as needed).
+const int SONAR_FRONT = D0;
+const int SONAR_LEFT  = D3;
+const int SONAR_RIGHT = D4;
 
 // --- Battery Voltage Monitoring (via voltage divider) ---
-const int VBAT_PIN = 35;  // Input-only pin, fine for ADC
+const int VBAT_PIN = A0;
 const float VBAT_DIVIDER_RATIO = 2.0; // *** ADJUST to your divider ***
 const float LOW_BATTERY_VOLTAGE = 6.0; // 2S LiPo cutoff (~3.0V/cell)
 
-// --- LEDC PWM Configuration ---
+// --- ESP8266 PWM Configuration ---
 const int PWM_FREQ       = 20000; // 20 kHz — silent operation
-const int PWM_RESOLUTION = 8;     // 8-bit (0-255)
-// (ESP32 Core 3.x: ledcAttach takes pin directly, no channel needed)
+const int PWM_MAX  = 255;
 
 // ================================================================
 //  CALIBRATION VALUES — *** MUST MEASURE & ADJUST AFTER TESTING ***
@@ -74,7 +70,7 @@ const int MOTOR_MIN_PWM = 45;
 
 // PID gains for wheel-distance control (tune Kp first, then Kd, then Ki)
 float Kp = 2.0;
-float Ki = 0.02;
+float Ki = 0.0;
 float Kd = 0.8;
 
 // PID gains for side-wall steering correction during straight moves
@@ -123,60 +119,100 @@ int speedRunLength = 0;
 // ================================================================
 volatile long countLeft  = 0;
 volatile long countRight = 0;
+volatile int8_t dirLeft  = 1;
+volatile int8_t dirRight = 1;
 
 // ================================================================
 //  FLOODFILL QUEUE (static circular buffer)
 // ================================================================
 struct Cell { int x, y; };
-Cell qBuf[MAZE_SIZE * MAZE_SIZE];
-int  qHead = 0, qTail = 0;
+const int Q_CAPACITY = MAZE_SIZE * MAZE_SIZE;
+Cell qBuf[Q_CAPACITY];
+bool qQueued[MAZE_SIZE][MAZE_SIZE];
+int  qHead = 0, qTail = 0, qCount = 0;
+bool qOverflowed = false;
+
+void qClear() {
+    qHead = 0;
+    qTail = 0;
+    qCount = 0;
+    qOverflowed = false;
+    for (int x = 0; x < MAZE_SIZE; x++)
+        for (int y = 0; y < MAZE_SIZE; y++)
+            qQueued[x][y] = false;
+}
 
 void qPush(int x, int y) {
+    if (x < 0 || x >= MAZE_SIZE || y < 0 || y >= MAZE_SIZE) return;
+    if (qQueued[x][y]) return;
+    if (qCount >= Q_CAPACITY) {
+        qOverflowed = true;
+        return;
+    }
     qBuf[qTail] = {x, y};
-    qTail = (qTail + 1) % (MAZE_SIZE * MAZE_SIZE);
+    qTail = (qTail + 1) % Q_CAPACITY;
+    qQueued[x][y] = true;
+    qCount++;
 }
 Cell qPop() {
+    if (qCount == 0) return {0, 0};
     Cell c = qBuf[qHead];
-    qHead = (qHead + 1) % (MAZE_SIZE * MAZE_SIZE);
+    qHead = (qHead + 1) % Q_CAPACITY;
+    qCount--;
+    qQueued[c.x][c.y] = false;
     return c;
 }
-bool qEmpty() { return qHead == qTail; }
+bool qEmpty() { return qCount == 0; }
 
 // ================================================================
 //  INTERRUPT SERVICE ROUTINES — Quadrature Encoders
 // ================================================================
-void IRAM_ATTR isrLeft()  { countLeft  += digitalRead(ENC_L_B) ? -1 : 1; }
-void IRAM_ATTR isrRight() { countRight += digitalRead(ENC_R_B) ? -1 : 1; }
+#define ISR_ATTR IRAM_ATTR
+
+void ISR_ATTR isrLeft()  { countLeft  += dirLeft; }
+void ISR_ATTR isrRight() { countRight += dirRight; }
 
 // ================================================================
-//  MOTOR CONTROL (TB6612FNG + LEDC PWM)
+//  MOTOR CONTROL (L298N + analogWrite PWM)
 // ================================================================
 void setMotorLeft(int speed) {
-    if (speed > 0) {
-        digitalWrite(AIN1, HIGH); digitalWrite(AIN2, LOW);
-    } else if (speed < 0) {
-        digitalWrite(AIN1, LOW);  digitalWrite(AIN2, HIGH);
-        speed = -speed;
-    } else {
-        digitalWrite(AIN1, LOW);  digitalWrite(AIN2, LOW);
-    }
     if (speed > 0 && speed < MOTOR_MIN_PWM) speed = MOTOR_MIN_PWM;
-    speed = constrain(speed, 0, 255);
-    ledcWrite(PWMA, speed);
+    if (speed < 0 && speed > -MOTOR_MIN_PWM) speed = -MOTOR_MIN_PWM;
+    speed = constrain(speed, -PWM_MAX, PWM_MAX);
+
+    if (speed > 0) {
+        dirLeft = 1;
+        analogWrite(IN1, speed);
+        digitalWrite(IN2, LOW);
+    } else if (speed < 0) {
+        dirLeft = -1;
+        digitalWrite(IN1, LOW);
+        analogWrite(IN2, -speed);
+    } else {
+        dirLeft = 0;
+        digitalWrite(IN1, LOW);
+        digitalWrite(IN2, LOW);
+    }
 }
 
 void setMotorRight(int speed) {
-    if (speed > 0) {
-        digitalWrite(BIN1, HIGH); digitalWrite(BIN2, LOW);
-    } else if (speed < 0) {
-        digitalWrite(BIN1, LOW);  digitalWrite(BIN2, HIGH);
-        speed = -speed;
-    } else {
-        digitalWrite(BIN1, LOW);  digitalWrite(BIN2, LOW);
-    }
     if (speed > 0 && speed < MOTOR_MIN_PWM) speed = MOTOR_MIN_PWM;
-    speed = constrain(speed, 0, 255);
-    ledcWrite(PWMB, speed);
+    if (speed < 0 && speed > -MOTOR_MIN_PWM) speed = -MOTOR_MIN_PWM;
+    speed = constrain(speed, -PWM_MAX, PWM_MAX);
+
+    if (speed > 0) {
+        dirRight = 1;
+        analogWrite(IN3, speed);
+        digitalWrite(IN4, LOW);
+    } else if (speed < 0) {
+        dirRight = -1;
+        digitalWrite(IN3, LOW);
+        analogWrite(IN4, -speed);
+    } else {
+        dirRight = 0;
+        digitalWrite(IN3, LOW);
+        digitalWrite(IN4, LOW);
+    }
 }
 
 void stopMotors() {
@@ -187,22 +223,24 @@ void stopMotors() {
 // ================================================================
 //  ULTRASONIC SENSORS
 // ================================================================
-float readUltrasonic(int trigPin, int echoPin) {
-    digitalWrite(trigPin, LOW);
+float readUltrasonicOnePin(int ioPin) {
+    pinMode(ioPin, OUTPUT);
+    digitalWrite(ioPin, LOW);
     delayMicroseconds(2);
-    digitalWrite(trigPin, HIGH);
+    digitalWrite(ioPin, HIGH);
     delayMicroseconds(10);
-    digitalWrite(trigPin, LOW);
-    long duration = pulseIn(echoPin, HIGH, 15000); // 15 ms timeout
+    digitalWrite(ioPin, LOW);
+    pinMode(ioPin, INPUT);
+    long duration = pulseIn(ioPin, HIGH, 15000); // 15 ms timeout
     if (duration == 0) return 999.0;               // No echo → no wall
     return duration * 0.0343 / 2.0;                // → centimeters
 }
 
 // Median of 3 readings — eliminates noise spikes
-float readUltrasonicFiltered(int trigPin, int echoPin) {
+float readUltrasonicFiltered(int ioPin) {
     float r[3];
     for (int i = 0; i < 3; i++) {
-        r[i] = readUltrasonic(trigPin, echoPin);
+        r[i] = readUltrasonicOnePin(ioPin);
         delayMicroseconds(200);
     }
     // Simple bubble sort for 3 elements → return median
@@ -212,16 +250,16 @@ float readUltrasonicFiltered(int trigPin, int echoPin) {
     return r[1];
 }
 
-float readFront() { return readUltrasonicFiltered(TRIG_FRONT, ECHO_FRONT); }
-float readLeft()  { return readUltrasonicFiltered(TRIG_LEFT,  ECHO_LEFT);  }
-float readRight() { return readUltrasonicFiltered(TRIG_RIGHT, ECHO_RIGHT); }
+float readFront() { return readUltrasonicFiltered(SONAR_FRONT); }
+float readLeft()  { return readUltrasonicFiltered(SONAR_LEFT);  }
+float readRight() { return readUltrasonicFiltered(SONAR_RIGHT); }
 
 // ================================================================
 //  BATTERY MONITORING
 // ================================================================
 float readBatteryVoltage() {
     int raw = analogRead(VBAT_PIN);
-    return (raw / 4095.0) * 3.3 * VBAT_DIVIDER_RATIO;
+    return (raw / 1023.0) * 3.3 * VBAT_DIVIDER_RATIO;
 }
 
 bool isBatteryLow() {
@@ -232,6 +270,7 @@ bool isBatteryLow() {
 //  MAZE INITIALIZATION
 // ================================================================
 void initMaze() {
+    qClear();
     for (int x = 0; x < MAZE_SIZE; x++) {
         for (int y = 0; y < MAZE_SIZE; y++) {
             walls[x][y]    = 0;
@@ -279,6 +318,10 @@ void updateDistances() {
             if (!(walls[c.x][c.y] & WALL_WEST)  && c.x > 0)             qPush(c.x - 1, c.y);
         }
     }
+    if (qOverflowed) {
+        Serial.println("! Flood queue overflow; run a full flood to recover");
+        qOverflowed = false;
+    }
 }
 
 // Record a newly-detected wall and trigger floodfill cascade
@@ -295,6 +338,7 @@ void addWall(int x, int y, uint8_t wallType) {
 
 // Full BFS re-flood from a rectangular target region
 void floodFrom(int x1, int y1, int x2, int y2) {
+    qClear();
     for (int x = 0; x < MAZE_SIZE; x++)
         for (int y = 0; y < MAZE_SIZE; y++)
             distances[x][y] = 999;
@@ -318,6 +362,10 @@ void floodFrom(int x1, int y1, int x2, int y2) {
         if (!(walls[c.x][c.y] & WALL_WEST) && c.x > 0 && distances[c.x - 1][c.y] > nd) {
             distances[c.x - 1][c.y] = nd; qPush(c.x - 1, c.y);
         }
+    }
+    if (qOverflowed) {
+        Serial.println("! Flood queue overflow during BFS");
+        qOverflowed = false;
     }
 }
 
@@ -575,33 +623,27 @@ void setup() {
     Serial.begin(115200);
     delay(500);
     Serial.println("Micromouse Initializing...");
+    Serial.println("ESP8266 mode: IN-pin PWM, encoder A-channel only, one-pin sonar.");
 
     // Motor driver pins
-    pinMode(AIN1, OUTPUT); pinMode(AIN2, OUTPUT);
-    pinMode(BIN1, OUTPUT); pinMode(BIN2, OUTPUT);
-    pinMode(STBY, OUTPUT);
-    digitalWrite(STBY, HIGH);  // Enable TB6612FNG
+    pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+    pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+    analogWriteRange(PWM_MAX);
+    analogWriteFreq(PWM_FREQ);
+    analogWrite(IN1, 0); analogWrite(IN2, 0);
+    analogWrite(IN3, 0); analogWrite(IN4, 0);
 
-    // LEDC PWM (Core 3.x API — attach pin with freq + resolution)
-    ledcAttach(PWMA, PWM_FREQ, PWM_RESOLUTION);
-    ledcAttach(PWMB, PWM_FREQ, PWM_RESOLUTION);
 
-    // Quadrature encoder pins
+    // Encoder pins (A channel only in ESP8266 mode)
     pinMode(ENC_L_A, INPUT_PULLUP);
-    pinMode(ENC_L_B, INPUT_PULLUP);
     pinMode(ENC_R_A, INPUT_PULLUP);
-    pinMode(ENC_R_B, INPUT_PULLUP);
     attachInterrupt(digitalPinToInterrupt(ENC_L_A), isrLeft,  RISING);
     attachInterrupt(digitalPinToInterrupt(ENC_R_A), isrRight, RISING);
 
-    // Ultrasonic pins
-    pinMode(TRIG_FRONT, OUTPUT); pinMode(ECHO_FRONT, INPUT);
-    pinMode(TRIG_LEFT,  OUTPUT); pinMode(ECHO_LEFT,  INPUT);
-    pinMode(TRIG_RIGHT, OUTPUT); pinMode(ECHO_RIGHT, INPUT);
-
-    // Battery ADC
-    pinMode(VBAT_PIN, INPUT);
-    analogReadResolution(12);
+    // Sonar one-pin lines idle as input; read function toggles direction.
+    pinMode(SONAR_FRONT, INPUT);
+    pinMode(SONAR_LEFT,  INPUT);
+    pinMode(SONAR_RIGHT, INPUT);
 
     // Maze
     initMaze();

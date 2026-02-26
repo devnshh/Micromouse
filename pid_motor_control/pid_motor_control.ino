@@ -16,25 +16,27 @@
 
 #include <Arduino.h>
 
-// --- TB6612FNG Motor Driver Pins (match your wiring) ---
-const int PWMA = 25;
-const int AIN1 = 26;
-const int AIN2 = 27;
-const int PWMB = 14;
-const int BIN1 = 12;
-const int BIN2 = 13;
-const int STBY = 4;   // *** ADJUST to your wiring ***
+#if !defined(ESP8266)
+#error "This sketch is configured for ESP8266. Select an ESP8266 board."
+#endif
+
+// --- L298N Motor Driver Pins (match your wiring) ---
+// Keep ENA/ENB jumpers on L298N enabled; PWM is applied on IN pins.
+// D8/D3/D4 are boot-strap pins on ESP8266; keep external pull states compatible.
+const int IN1 = D5;
+const int IN2 = D6;
+const int IN3 = D7;
+const int IN4 = D8;
 
 // --- Encoder Pins (Quadrature A+B) ---
-const int ENC_L_A = 32;
-const int ENC_L_B = 33;
-const int ENC_R_A = 16;
-const int ENC_R_B = 17;
+const int ENC_L_A = D1;
+const int ENC_L_B = D2;
+const int ENC_R_A = D3;
+const int ENC_R_B = D4;
 
-// --- LEDC PWM Config ---
-const int PWM_FREQ       = 20000;
-const int PWM_RESOLUTION = 8;
-// (ESP32 Core 3.x: ledcAttach takes pin directly, no channel needed)
+// --- PWM Config ---
+const int PWM_FREQ = 20000;
+const int PWM_MAX  = 255;
 
 // --- Encoder Counters ---
 volatile long countLeft  = 0;
@@ -42,7 +44,7 @@ volatile long countRight = 0;
 
 // --- PID Constants (TUNE THESE!) ---
 float Kp = 2.0;
-float Ki = 0.02;
+float Ki = 0.0;
 float Kd = 0.8;
 
 // --- Calibration targets (fill in after measuring) ---
@@ -56,8 +58,10 @@ const unsigned long MOVE_TIMEOUT_MS = 3000;
 // ================================================================
 //  ISRs — Quadrature direction detection
 // ================================================================
-void IRAM_ATTR isrLeft()  { countLeft  += digitalRead(ENC_L_B) ? -1 : 1; }
-void IRAM_ATTR isrRight() { countRight += digitalRead(ENC_R_B) ? -1 : 1; }
+#define ISR_ATTR IRAM_ATTR
+
+void ISR_ATTR isrLeft()  { countLeft  += digitalRead(ENC_L_B) ? -1 : 1; }
+void ISR_ATTR isrRight() { countRight += digitalRead(ENC_R_B) ? -1 : 1; }
 
 // ================================================================
 //  SETUP
@@ -68,14 +72,12 @@ void setup() {
     Serial.println("=== Motor Test Sketch ===");
 
     // Motor driver
-    pinMode(AIN1, OUTPUT); pinMode(AIN2, OUTPUT);
-    pinMode(BIN1, OUTPUT); pinMode(BIN2, OUTPUT);
-    pinMode(STBY, OUTPUT);
-    digitalWrite(STBY, HIGH); // Enable TB6612FNG
-
-    // LEDC PWM (Core 3.x API)
-    ledcAttach(PWMA, PWM_FREQ, PWM_RESOLUTION);
-    ledcAttach(PWMB, PWM_FREQ, PWM_RESOLUTION);
+    pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+    pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+    analogWriteRange(PWM_MAX);
+    analogWriteFreq(PWM_FREQ);
+    analogWrite(IN1, 0); analogWrite(IN2, 0);
+    analogWrite(IN3, 0); analogWrite(IN4, 0);
 
     // Encoders
     pinMode(ENC_L_A, INPUT_PULLUP);
@@ -98,31 +100,37 @@ void setup() {
 //  MOTOR HELPERS
 // ================================================================
 void setMotorLeft(int speed) {
-    if (speed > 0) {
-        digitalWrite(AIN1, HIGH); digitalWrite(AIN2, LOW);
-    } else if (speed < 0) {
-        digitalWrite(AIN1, LOW);  digitalWrite(AIN2, HIGH);
-        speed = -speed;
-    } else {
-        digitalWrite(AIN1, LOW);  digitalWrite(AIN2, LOW);
-    }
     if (speed > 0 && speed < MOTOR_MIN_PWM) speed = MOTOR_MIN_PWM;
-    speed = constrain(speed, 0, 255);
-    ledcWrite(PWMA, speed);
+    if (speed < 0 && speed > -MOTOR_MIN_PWM) speed = -MOTOR_MIN_PWM;
+    speed = constrain(speed, -PWM_MAX, PWM_MAX);
+
+    if (speed > 0) {
+        analogWrite(IN1, speed);
+        digitalWrite(IN2, LOW);
+    } else if (speed < 0) {
+        digitalWrite(IN1, LOW);
+        analogWrite(IN2, -speed);
+    } else {
+        digitalWrite(IN1, LOW);
+        digitalWrite(IN2, LOW);
+    }
 }
 
 void setMotorRight(int speed) {
-    if (speed > 0) {
-        digitalWrite(BIN1, HIGH); digitalWrite(BIN2, LOW);
-    } else if (speed < 0) {
-        digitalWrite(BIN1, LOW);  digitalWrite(BIN2, HIGH);
-        speed = -speed;
-    } else {
-        digitalWrite(BIN1, LOW);  digitalWrite(BIN2, LOW);
-    }
     if (speed > 0 && speed < MOTOR_MIN_PWM) speed = MOTOR_MIN_PWM;
-    speed = constrain(speed, 0, 255);
-    ledcWrite(PWMB, speed);
+    if (speed < 0 && speed > -MOTOR_MIN_PWM) speed = -MOTOR_MIN_PWM;
+    speed = constrain(speed, -PWM_MAX, PWM_MAX);
+
+    if (speed > 0) {
+        analogWrite(IN3, speed);
+        digitalWrite(IN4, LOW);
+    } else if (speed < 0) {
+        digitalWrite(IN3, LOW);
+        analogWrite(IN4, -speed);
+    } else {
+        digitalWrite(IN3, LOW);
+        digitalWrite(IN4, LOW);
+    }
 }
 
 void stopMotors() {
@@ -183,10 +191,10 @@ void findMinPWM() {
     Serial.println("Ramping left motor PWM from 0 to 100...");
     for (int pwm = 0; pwm <= 100; pwm += 5) {
         countLeft = 0;
-        digitalWrite(AIN1, HIGH); digitalWrite(AIN2, LOW);
-        ledcWrite(PWMA, pwm);
+        digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+        analogWrite(IN1, pwm);
         delay(300);
-        ledcWrite(PWMA, 0);
+        analogWrite(IN1, 0);
         Serial.printf("  PWM=%3d  ticks=%ld\n", pwm, countLeft);
         delay(200);
     }

@@ -2,7 +2,7 @@
  * ===============================================
  *  TEST 90-DEGREE TURNS — Single Motor Setup
  * ===============================================
- *  Setup: 1x N20 motor + L298N + ESP32 via USB
+ *  Setup: 1x N20 motor + L298N + ESP8266 via USB
  *         Testing ONE motor at a time.
  *
  *  NOTE: For a real 90° turn you need BOTH motors
@@ -14,13 +14,13 @@
  *      when both motors are connected
  *
  *  Wiring (same as get_ppr.ino):
- *    L298N ENA  → ESP32 GPIO 25
- *    L298N IN1  → ESP32 GPIO 26
- *    L298N IN2  → ESP32 GPIO 27
- *    Encoder A  → ESP32 GPIO 32
- *    Encoder B  → ESP32 GPIO 33
- *    Encoder VCC → ESP32 3.3V
- *    Encoder GND → ESP32 GND
+ *    L298N ENA  -> 5V (jumper ON)
+ *    L298N IN1  -> ESP8266 D5
+ *    L298N IN2  -> ESP8266 D6
+ *    Encoder A  -> ESP8266 D1
+ *    Encoder B  -> ESP8266 D2
+ *    Encoder VCC → ESP8266 3.3V
+ *    Encoder GND → ESP8266 GND
  *
  *  How to use:
  *    1. First get your PPR from get_ppr.ino
@@ -40,22 +40,28 @@
 
 #include <Arduino.h>
 
+#if !defined(ESP8266)
+#error "This sketch is configured for ESP8266. Select an ESP8266 board."
+#endif
+
 // =============================================
 //  PIN DEFINITIONS — match to YOUR wiring
 // =============================================
-const int ENA = 25;
-const int IN1 = 26;
-const int IN2 = 27;
+// Keep ENA jumper enabled on L298N; PWM is applied on IN pins.
+const int IN1 = D5;
+const int IN2 = D6;
 
-const int ENC_A = 32;
-const int ENC_B = 33;
+const int ENC_A = D1;
+const int ENC_B = D2;
 // =============================================
 
 const int PWM_FREQ = 5000;
-const int PWM_RES  = 8;
+const int PWM_MAX  = 255;
 
 volatile long ticks = 0;
-void IRAM_ATTR encoderISR() {
+#define ISR_ATTR IRAM_ATTR
+
+void ISR_ATTR encoderISR() {
     ticks += digitalRead(ENC_B) ? -1 : 1;
 }
 
@@ -72,8 +78,10 @@ void setup() {
     pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
     digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
 
-    ledcAttach(ENA, PWM_FREQ, PWM_RES);
-    ledcWrite(ENA, 0);
+    analogWriteRange(PWM_MAX);
+    analogWriteFreq(PWM_FREQ);
+    analogWrite(IN1, 0);
+    analogWrite(IN2, 0);
 
     pinMode(ENC_A, INPUT_PULLUP);
     pinMode(ENC_B, INPUT_PULLUP);
@@ -82,7 +90,7 @@ void setup() {
     Serial.println("========================================");
     Serial.println("  TURN TESTER — Single Motor");
     Serial.println("========================================");
-    Serial.printf( "  Pins: ENA=%d IN1=%d IN2=%d\n", ENA, IN1, IN2);
+    Serial.printf( "  Pins: IN1=%d IN2=%d\n", IN1, IN2);
     Serial.printf( "  Encoder: A=%d B=%d\n", ENC_A, ENC_B);
     Serial.printf( "  Target ticks: %ld\n", targetTicks);
     Serial.printf( "  Motor speed:  %d PWM\n", motorSpeed);
@@ -101,7 +109,8 @@ void setup() {
 void stopMotor() {
     digitalWrite(IN1, LOW);
     digitalWrite(IN2, LOW);
-    ledcWrite(ENA, 0);
+    analogWrite(IN1, 0);
+    analogWrite(IN2, 0);
 }
 
 void spinMotor(bool forward, long target) {
@@ -109,11 +118,12 @@ void spinMotor(bool forward, long target) {
     unsigned long t0 = millis();
 
     if (forward) {
-        digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+        analogWrite(IN1, motorSpeed);
+        digitalWrite(IN2, LOW);
     } else {
-        digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+        digitalWrite(IN1, LOW);
+        analogWrite(IN2, motorSpeed);
     }
-    ledcWrite(ENA, motorSpeed);
 
     // Wait until we reach target ticks
     long absTicks = 0;
@@ -122,7 +132,9 @@ void spinMotor(bool forward, long target) {
 
         // Slow down when close (last 20%)
         if (target - absTicks < target / 5) {
-            ledcWrite(ENA, max(40, motorSpeed / 2));
+            int slowPwm = max(40, motorSpeed / 2);
+            if (forward) analogWrite(IN1, slowPwm);
+            else         analogWrite(IN2, slowPwm);
         }
 
         if (millis() - t0 > TIMEOUT_MS) {
