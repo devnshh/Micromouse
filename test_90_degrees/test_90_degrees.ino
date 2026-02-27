@@ -107,8 +107,6 @@ void setup() {
 }
 
 void stopMotor() {
-    digitalWrite(IN1, LOW);
-    digitalWrite(IN2, LOW);
     analogWrite(IN1, 0);
     analogWrite(IN2, 0);
 }
@@ -118,10 +116,10 @@ void spinMotor(bool forward, long target) {
     unsigned long t0 = millis();
 
     if (forward) {
+        analogWrite(IN2, 0);
         analogWrite(IN1, motorSpeed);
-        digitalWrite(IN2, LOW);
     } else {
-        digitalWrite(IN1, LOW);
+        analogWrite(IN1, 0);
         analogWrite(IN2, motorSpeed);
     }
 

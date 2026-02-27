@@ -99,8 +99,6 @@ void setup() {
 }
 
 void stopMotor() {
-    digitalWrite(IN1, LOW);
-    digitalWrite(IN2, LOW);
     analogWrite(IN1, 0);
     analogWrite(IN2, 0);
 }
@@ -108,9 +106,11 @@ void stopMotor() {
 void runMotor(bool forward, int pwm, int durationMs) {
     ticks = 0;
     if (forward) {
-        analogWrite(IN1, pwm); digitalWrite(IN2, LOW);
+        analogWrite(IN2, 0);
+        analogWrite(IN1, pwm);
     } else {
-        digitalWrite(IN1, LOW); analogWrite(IN2, pwm);
+        analogWrite(IN1, 0);
+        analogWrite(IN2, pwm);
     }
     delay(durationMs);
     stopMotor();

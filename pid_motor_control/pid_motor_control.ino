@@ -105,14 +105,14 @@ void setMotorLeft(int speed) {
     speed = constrain(speed, -PWM_MAX, PWM_MAX);
 
     if (speed > 0) {
+        analogWrite(IN2, 0);
         analogWrite(IN1, speed);
-        digitalWrite(IN2, LOW);
     } else if (speed < 0) {
-        digitalWrite(IN1, LOW);
+        analogWrite(IN1, 0);
         analogWrite(IN2, -speed);
     } else {
-        digitalWrite(IN1, LOW);
-        digitalWrite(IN2, LOW);
+        analogWrite(IN1, 0);
+        analogWrite(IN2, 0);
     }
 }
 
@@ -122,14 +122,14 @@ void setMotorRight(int speed) {
     speed = constrain(speed, -PWM_MAX, PWM_MAX);
 
     if (speed > 0) {
+        analogWrite(IN4, 0);
         analogWrite(IN3, speed);
-        digitalWrite(IN4, LOW);
     } else if (speed < 0) {
-        digitalWrite(IN3, LOW);
+        analogWrite(IN3, 0);
         analogWrite(IN4, -speed);
     } else {
-        digitalWrite(IN3, LOW);
-        digitalWrite(IN4, LOW);
+        analogWrite(IN3, 0);
+        analogWrite(IN4, 0);
     }
 }
 
